@@ -4,7 +4,16 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union, cast
+from typing import (
+    Any,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    Union,
+    cast,
+)
 from llama_index.core.agent.function_calling.step import (
     build_error_tool_output,
     build_missing_tool_message,
@@ -25,6 +34,7 @@ from llama_index.core.chat_engine.types import (
     StreamingAgentChatResponse,
 )
 from llama_index.core.tools import BaseTool, ToolOutput, adapt_to_async_tool
+from openai.types.beta.assistant_stream_event import AssistantStreamEvent
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
@@ -166,6 +176,47 @@ def format_attachments(file_ids: Optional[List[str]] = None) -> List[Dict[str, s
     """Create attachments from file_ids."""
     file_ids = file_ids or []
     return [{"file_id": file_id} for file_id in file_ids]
+
+
+def _get_openai_assistant_stream_event_types() -> set[str]:
+    """Return all OpenAI assistant stream event types.
+
+    I.e., 'thread.run.requires_action', 'thread.run.completed', 'thread.run.failed', etc.
+    """
+    import inspect
+    from typing import get_args
+
+    import openai.types.beta.assistant_stream_event as assistant_stream_event_module
+    from openai._models import BaseModel
+
+    # https://github.com/openai/openai-python/blob/main/src/openai/types/beta/assistant_stream_event.py
+    assistant_stream_event_module_symbols = assistant_stream_event_module.__all__
+    assistant_stream_event_module_values = [
+        getattr(assistant_stream_event_module, t)
+        for t in assistant_stream_event_module_symbols
+    ]
+    assistant_stream_event_module_classes = [
+        c for c in assistant_stream_event_module_values if inspect.isclass(c)
+    ]
+    assistant_stream_event_module_base_models = [
+        c for c in assistant_stream_event_module_classes if issubclass(c, BaseModel)
+    ]
+
+    _event_types = set()
+
+    for cls in assistant_stream_event_module_base_models:
+        event_field = cls.__annotations__.get("event")
+        if not event_field:
+            continue
+        (event_field_literal_value,) = get_args(event_field)
+        if not event_field_literal_value:
+            continue
+        _event_types.add(event_field_literal_value)
+
+    return _event_types
+
+
+_DEFAULT_STREAM_CHAT_EVENT_TYPES_TO_YIELD = _get_openai_assistant_stream_event_types()
 
 
 class OpenAIAssistantAgent(BaseAgent):
@@ -375,12 +426,14 @@ class OpenAIAssistantAgent(BaseAgent):
             attachments=attachments,
         )
 
-    def _run_function_calling(self, run: Any) -> List[ToolOutput]:
-        """Run function calling."""
+    def _run_tools_and_get_outputs(
+        self, run: Any
+    ) -> tuple[List[ToolOutput], List[dict[str, str]]]:
         tool_calls = run.required_action.submit_tool_outputs.tool_calls
         tool_output_dicts = []
         tool_output_objs: List[ToolOutput] = []
 
+        # TODO: call tools concurrently?
         for tool_call in tool_calls:
             fn_obj = tool_call.function
             _, tool_output = call_function(self._tools, fn_obj, verbose=self._verbose)
@@ -388,6 +441,12 @@ class OpenAIAssistantAgent(BaseAgent):
                 {"tool_call_id": tool_call.id, "output": str(tool_output)}
             )
             tool_output_objs.append(tool_output)
+
+        return tool_output_objs, tool_output_dicts
+
+    def _run_function_calling(self, run: Any) -> List[ToolOutput]:
+        """Run function calling."""
+        tool_output_objs, tool_output_dicts = self._run_tools_and_get_outputs(run)
 
         # submit tool outputs
         # TODO: openai's typing is a bit sus
@@ -482,6 +541,55 @@ class OpenAIAssistantAgent(BaseAgent):
             )
         return run, {"sources": sources}
 
+    def run_assistant_stream(
+        self,
+        instructions_prefix: Optional[str] = None,
+        event_types_to_yield: set[str] = _DEFAULT_STREAM_CHAT_EVENT_TYPES_TO_YIELD,
+    ) -> Iterator[AssistantStreamEvent]:
+        """Run assistant."""
+        instructions_prefix = instructions_prefix or self._instructions_prefix
+
+        assistant_id = self._assistant.id
+        thread_id = self._thread_id
+
+        def _run_and_process_stream():
+            with self._client.beta.threads.runs.stream(
+                thread_id=thread_id,
+                assistant_id=assistant_id,
+                instructions=instructions_prefix,
+            ) as run_stream:
+                for run_event in run_stream:
+                    run = run_event.data
+                    run_id = run.id
+
+                    if self._verbose:
+                        print(
+                            f"run event: {run_event.event}",
+                            end="",
+                            flush=True,
+                        )
+                        print(run_event)
+
+                    if run_event.event == "thread.run.requires_action":
+                        _, tool_output_dicts = self._run_tools_and_get_outputs(run)
+
+                        with self._client.beta.threads.runs.submit_tool_outputs_stream(
+                            thread_id=thread_id,
+                            run_id=run_id,
+                            tool_outputs=tool_output_dicts,
+                        ) as tools_stream:
+                            for tools_event in tools_stream:
+                                if self._verbose:
+                                    print(f"tool output event: {tools_event.event}")
+                                    print(tools_event)
+                                if tools_event.event in event_types_to_yield:
+                                    yield tools_event
+                    else:
+                        if run_event.event in event_types_to_yield:
+                            yield run_event
+
+        return _run_and_process_stream()
+
     @property
     def latest_message(self) -> ChatMessage:
         """Get latest message."""
@@ -567,14 +675,54 @@ class OpenAIAssistantAgent(BaseAgent):
             e.on_end(payload={EventPayload.RESPONSE: chat_response})
         return chat_response
 
-    @trace_method("chat")
+    def _stream_chat(
+        self,
+        message: str,
+        chat_history: Optional[List[ChatMessage]] = None,
+        function_call: Union[str, dict] = "auto",
+        mode: ChatResponseMode = ChatResponseMode.WAIT,
+        event_types_to_yield: set[str] = _DEFAULT_STREAM_CHAT_EVENT_TYPES_TO_YIELD,
+    ) -> Iterator[AssistantStreamEvent]:
+        """Main chat interface."""
+        # TODO: since chat interface doesn't expose additional kwargs
+        # we can't pass in file_ids per message
+        _added_message_obj = self.add_message(message)
+
+        return self.run_assistant_stream(
+            instructions_prefix=self._instructions_prefix,
+            event_types_to_yield=event_types_to_yield,
+        )
+
+    @trace_method("stream_chat")
     def stream_chat(
         self,
         message: str,
         chat_history: Optional[List[ChatMessage]] = None,
         function_call: Union[str, dict] = "auto",
-    ) -> StreamingAgentChatResponse:
-        raise NotImplementedError("stream_chat not implemented")
+        event_types_to_yield: set[str] = _DEFAULT_STREAM_CHAT_EVENT_TYPES_TO_YIELD,
+    ) -> Iterator[AssistantStreamEvent]:
+        """
+        Add a message to the thread and run the assistant in streaming mode.
+
+        Args:
+            message: Message to add to the thread.
+            chat_history: Chat history.
+            function_call: Function call.
+            event_types_to_yield: Event types to yield.
+
+        Example usage:
+            ```python
+            for event in agent.stream_chat("Hello"):
+                print(f"event: {event.event}\\n{event.data}")
+            ```
+        """
+        return self._stream_chat(
+            message,
+            chat_history,
+            function_call,
+            mode=ChatResponseMode.WAIT,
+            event_types_to_yield=event_types_to_yield,
+        )
 
     @trace_method("chat")
     async def astream_chat(
