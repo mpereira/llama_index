@@ -44,7 +44,6 @@ from llama_index.llms.vertex.utils import (
 from vertexai.generative_models._generative_models import SafetySettingsType
 
 if TYPE_CHECKING:
-    from llama_index.core.chat_engine.types import AgentChatResponse
     from llama_index.core.tools.types import BaseTool
 
 
@@ -55,7 +54,7 @@ class Vertex(FunctionCallingLLM):
         `pip install llama-index-llms-vertex`
 
         ```python
-        from llama_index.llms.openai import Vertex
+        from llama_index.llms.vertex import Vertex
 
         # Set up necessary variables
         credentials = {
@@ -120,6 +119,22 @@ class Vertex(FunctionCallingLLM):
         additional_kwargs = additional_kwargs or {}
         callback_manager = callback_manager or CallbackManager([])
 
+        super().__init__(
+            temperature=temperature,
+            max_tokens=max_tokens,
+            additional_kwargs=additional_kwargs,
+            max_retries=max_retries,
+            model=model,
+            examples=examples,
+            iscode=iscode,
+            callback_manager=callback_manager,
+            system_prompt=system_prompt,
+            messages_to_prompt=messages_to_prompt,
+            completion_to_prompt=completion_to_prompt,
+            pydantic_program_mode=pydantic_program_mode,
+            output_parser=output_parser,
+        )
+
         self._is_gemini = False
         self._is_chat_model = False
         if model in CHAT_MODELS:
@@ -149,22 +164,6 @@ class Vertex(FunctionCallingLLM):
             self._is_chat_model = True
         else:
             raise (ValueError(f"Model {model} not found, please verify the model name"))
-
-        super().__init__(
-            temperature=temperature,
-            max_tokens=max_tokens,
-            additional_kwargs=additional_kwargs,
-            max_retries=max_retries,
-            model=model,
-            examples=examples,
-            iscode=iscode,
-            callback_manager=callback_manager,
-            system_prompt=system_prompt,
-            messages_to_prompt=messages_to_prompt,
-            completion_to_prompt=completion_to_prompt,
-            pydantic_program_mode=pydantic_program_mode,
-            output_parser=output_parser,
-        )
 
     @classmethod
     def class_name(cls) -> str:
@@ -431,7 +430,7 @@ class Vertex(FunctionCallingLLM):
     ) -> CompletionResponseAsyncGen:
         raise (ValueError("Not Implemented"))
 
-    def chat_with_tools(
+    def _prepare_chat_with_tools(
         self,
         tools: List["BaseTool"],
         user_msg: Optional[Union[str, ChatMessage]] = None,
@@ -439,8 +438,8 @@ class Vertex(FunctionCallingLLM):
         verbose: bool = False,
         allow_parallel_tool_calls: bool = False,
         **kwargs: Any,
-    ) -> ChatResponse:
-        """Predict and call the tool."""
+    ) -> Dict[str, Any]:
+        """Prepare the arguments needed to let the LLM chat with tools."""
         chat_history = chat_history or []
 
         if isinstance(user_msg, str):
@@ -457,49 +456,27 @@ class Vertex(FunctionCallingLLM):
                 }
             )
 
-        response = self.chat(chat_history, tools=tool_dicts, **kwargs)
+        return {
+            "messages": chat_history,
+            "tools": tool_dicts or None,
+            **kwargs,
+        }
 
-        if not allow_parallel_tool_calls:
-            force_single_tool_call(response)
-
-        return response
-
-    async def achat_with_tools(
+    def _validate_chat_with_tools_response(
         self,
+        response: ChatResponse,
         tools: List["BaseTool"],
-        user_msg: Optional[Union[str, ChatMessage]] = None,
-        chat_history: Optional[List[ChatMessage]] = None,
-        verbose: bool = False,
         allow_parallel_tool_calls: bool = False,
         **kwargs: Any,
     ) -> ChatResponse:
-        """Predict and call the tool."""
-        chat_history = chat_history or []
-
-        if isinstance(user_msg, str):
-            user_msg = ChatMessage(role=MessageRole.USER, content=user_msg)
-            chat_history.append(user_msg)
-
-        tool_dicts = []
-        for tool in tools:
-            tool_dicts.append(
-                {
-                    "name": tool.metadata.name,
-                    "description": tool.metadata.description,
-                    "parameters": tool.metadata.get_parameters_dict(),
-                }
-            )
-
-        response = await self.achat(chat_history, tools=tool_dicts, **kwargs)
-
+        """Validate the response from chat_with_tools."""
         if not allow_parallel_tool_calls:
             force_single_tool_call(response)
-
         return response
 
     def get_tool_calls_from_response(
         self,
-        response: "AgentChatResponse",
+        response: "ChatResponse",
         error_on_no_tool_call: bool = True,
         **kwargs: Any,
     ) -> List[ToolSelection]:
